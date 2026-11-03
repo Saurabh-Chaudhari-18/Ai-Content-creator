@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from typing import Optional, List
 
 from app.db.database import get_db
+from app.config import settings
 from app.models import User, SocialAccount, SocialPlatform, WorkspaceMember, WorkspaceRole
 from app.schemas.schemas import SocialAccountResponse, MessageResponse
 from app.core.security import encrypt_token
@@ -60,7 +61,13 @@ async def mock_connect_social_account(
     """
     Connect a mock/test social account.
     Enables full end-to-end testing of posting and scheduling during MVP phase.
+
+    DEVELOPMENT/STAGING ONLY — in production this endpoint does not exist:
+    mock accounts would show customers fake "Published" results.
     """
+    if settings.ENVIRONMENT == "production":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found.")
+
     member_res = await db.execute(
         select(WorkspaceMember).where(
             WorkspaceMember.workspace_id == workspace_id,

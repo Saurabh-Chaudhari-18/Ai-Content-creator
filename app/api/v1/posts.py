@@ -8,7 +8,7 @@ from typing import Optional, List
 
 from app.db.database import get_db
 from app.models import (
-    User, Post, PostMedia, Brand, WorkspaceMember, ApprovalLog,
+    User, Post, PostMedia, Brand, WorkspaceMember, WorkspaceRole, ApprovalLog,
     PostStatus, ApprovalAction, PublishJob, JobStatus, SocialAccount
 )
 from app.schemas.schemas import (
@@ -20,6 +20,9 @@ from app.core.security import compute_content_hash
 from app.core.dependencies import get_current_user
 
 router = APIRouter(tags=["Posts"])
+
+# Roles allowed to approve/reject content (separation of duties)
+APPROVER_ROLES = (WorkspaceRole.OWNER, WorkspaceRole.ADMIN)
 
 
 async def check_brand_access(brand_id: UUID, user_id: UUID, db: AsyncSession) -> Brand:
@@ -48,6 +51,39 @@ async def check_post_access(post_id: UUID, user_id: UUID, db: AsyncSession) -> P
     if not post:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Post not found or access denied.")
     return post
+
+
+async def get_post_membership(post: Post, user_id: UUID, db: AsyncSession) -> WorkspaceMember:
+    """Resolve the caller's workspace membership (and role) for a post's workspace."""
+    stmt = (
+        select(WorkspaceMember)
+        .join(Brand, Brand.workspace_id == WorkspaceMember.workspace_id)
+        .where(Brand.id == post.brand_id, WorkspaceMember.user_id == user_id)
+    )
+    res = await db.execute(stmt)
+    member = res.scalar_one_or_none()
+    if not member:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Post not found or access denied.")
+    return member
+
+
+async def _cancel_queued_jobs(post: Post, db: AsyncSession, reason: str) -> None:
+    """Cancel all queued publish jobs for a post and best-effort revoke their Celery tasks."""
+    jobs_res = await db.execute(
+        select(PublishJob).where(
+            PublishJob.post_id == post.id,
+            PublishJob.status == JobStatus.QUEUED,
+        )
+    )
+    for job in jobs_res.scalars().all():
+        job.status = JobStatus.CANCELLED
+        job.error_message = reason
+        if job.celery_task_id:
+            try:
+                from app.workers.celery_app import celery_app
+                celery_app.control.revoke(job.celery_task_id)
+            except Exception:
+                pass  # Worker-side status guard is the real safety net
 
 
 @router.get("/brands/{brand_id}/posts", response_model=PostListResponse)
@@ -140,7 +176,15 @@ async def update_post(
 ):
     post = await check_post_access(post_id, current_user.id, db)
 
-    was_approved = post.status in [PostStatus.APPROVED, PostStatus.SCHEDULED]
+    # Guard: content that is live (or mid-dispatch) is immutable.
+    if post.status in (PostStatus.PUBLISHING, PostStatus.PUBLISHED):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Published or publishing posts cannot be edited. Duplicate the post instead.",
+        )
+
+    prev_status = post.status
+    was_approved = prev_status in (PostStatus.APPROVED, PostStatus.SCHEDULED)
 
     # Update fields
     if req.title is not None:
@@ -174,6 +218,11 @@ async def update_post(
             )
             db.add(invalidation_log)
 
+            # A scheduled post that got edited must not keep live jobs around.
+            if prev_status == PostStatus.SCHEDULED:
+                await _cancel_queued_jobs(post, db, "Cancelled: content was edited after scheduling.")
+                post.scheduled_at = None
+
     await db.commit()
     await db.refresh(post)
     return PostResponse.model_validate(post)
@@ -186,6 +235,13 @@ async def submit_for_approval(
     current_user: User = Depends(get_current_user),
 ):
     post = await check_post_access(post_id, current_user.id, db)
+
+    # Guard: only drafts can be submitted for review.
+    if post.status != PostStatus.DRAFT:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Only drafts can be submitted for approval. Current status: {post.status.value}",
+        )
 
     post.status = PostStatus.PENDING_APPROVAL
     media_urls = [m.media_url for m in post.media]
@@ -210,11 +266,39 @@ async def approve_post(
     current_user: User = Depends(get_current_user),
 ):
     post = await check_post_access(post_id, current_user.id, db)
+    member = await get_post_membership(post, current_user.id, db)
+
+    # Guard 1: state machine — only pending posts can be approved.
+    if post.status != PostStatus.PENDING_APPROVAL:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Only posts pending approval can be approved. Current status: {post.status.value}",
+        )
+
+    # Guard 2: RBAC — only owners and admins approve.
+    if member.role not in APPROVER_ROLES:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only workspace owners and admins can approve posts.",
+        )
+
+    # Guard 3: separation of duties — creators cannot approve their own posts.
+    if post.created_by == current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You cannot approve a post you created. Another admin or the owner must review it.",
+        )
+
+    # Guard 4: integrity — verify (not recompute-and-bless) the submitted content.
+    media_urls = [m.media_url for m in post.media]
+    current_hash = compute_content_hash(post.caption, media_urls)
+    if current_hash != post.content_hash:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Post content changed since it was submitted. It must be resubmitted for approval.",
+        )
 
     post.status = PostStatus.APPROVED
-    media_urls = [m.media_url for m in post.media]
-    post.content_hash = compute_content_hash(post.caption, media_urls)
-
     log = ApprovalLog(
         post_id=post.id,
         user_id=current_user.id,
@@ -235,6 +319,19 @@ async def reject_post(
     current_user: User = Depends(get_current_user),
 ):
     post = await check_post_access(post_id, current_user.id, db)
+    member = await get_post_membership(post, current_user.id, db)
+
+    if post.status != PostStatus.PENDING_APPROVAL:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Only posts pending approval can be rejected. Current status: {post.status.value}",
+        )
+
+    if member.role not in APPROVER_ROLES:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only workspace owners and admins can reject posts.",
+        )
 
     post.status = PostStatus.DRAFT
     log = ApprovalLog(
@@ -259,11 +356,11 @@ async def schedule_post(
 ):
     post = await check_post_access(post_id, current_user.id, db)
 
-    # In strict mode, posts must be approved first. If in draft, require submit/approve or auto-promote if owner
+    # In strict mode, posts must be approved first.
     if post.status != PostStatus.APPROVED:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Only approved posts can be scheduled. Current status: {post.status}"
+            detail=f"Only approved posts can be scheduled. Current status: {post.status.value}"
         )
 
     # Validate scheduled time is in future
@@ -273,16 +370,45 @@ async def schedule_post(
             detail="Scheduled date and time must be in the future."
         )
 
+    if not req.social_account_ids:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one social account must be selected."
+        )
+
+    # ── TENANT ISOLATION GUARD ─────────────────────────────────────────
+    # Every target social account must belong to THIS post's workspace and
+    # be active. Without this check, a caller could publish through another
+    # tenant's connected pages (cross-tenant publishing / BOLA).
+    brand_res = await db.execute(select(Brand).where(Brand.id == post.brand_id))
+    brand = brand_res.scalar_one()
+
+    requested_ids = set(req.social_account_ids)
+    acc_res = await db.execute(
+        select(SocialAccount).where(
+            SocialAccount.id.in_(requested_ids),
+            SocialAccount.workspace_id == brand.workspace_id,
+            SocialAccount.is_active == True,
+        )
+    )
+    valid_accounts = acc_res.scalars().all()
+    if len(valid_accounts) != len(requested_ids):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="One or more social accounts were not found in this workspace or are inactive.",
+        )
+    # ───────────────────────────────────────────────────────────────────
+
     post.scheduled_at = req.scheduled_at
     post.timezone = req.timezone
     post.status = PostStatus.SCHEDULED
 
     # Create PublishJob for each target social account and dispatch to Celery
     created_job_ids: List[UUID] = []
-    for acc_id in req.social_account_ids:
+    for account in valid_accounts:
         job = PublishJob(
             post_id=post.id,
-            social_account_id=acc_id,
+            social_account_id=account.id,
             status=JobStatus.QUEUED,
             scheduled_for=req.scheduled_at,
         )
@@ -296,7 +422,7 @@ async def schedule_post(
             task = publish_post_task.apply_async(
                 kwargs={
                     "post_id": str(post.id),
-                    "social_account_id": str(acc_id),
+                    "social_account_id": str(account.id),
                     "job_id": str(job.id),
                 },
                 eta=req.scheduled_at,
@@ -311,7 +437,7 @@ async def schedule_post(
     return ScheduleResponse(
         post_id=post.id,
         scheduled_at=post.scheduled_at,
-        social_account_ids=req.social_account_ids,
+        social_account_ids=list(requested_ids),
         job_ids=created_job_ids,
     )
 
@@ -340,6 +466,10 @@ async def delete_post(
     current_user: User = Depends(get_current_user),
 ):
     post = await check_post_access(post_id, current_user.id, db)
+
+    # Revoke any queued Celery tasks before the cascade removes the job rows.
+    await _cancel_queued_jobs(post, db, "Cancelled: post was deleted.")
+
     await db.delete(post)
     await db.commit()
     return MessageResponse(message="Post successfully deleted.")

@@ -170,14 +170,34 @@ async def add_workspace_member(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    await check_workspace_access(workspace_id, current_user.id, db, [WorkspaceRole.OWNER, WorkspaceRole.ADMIN])
+    caller = await check_workspace_access(
+        workspace_id, current_user.id, db, [WorkspaceRole.OWNER, WorkspaceRole.ADMIN]
+    )
+
+    # ── PRIVILEGE ESCALATION GUARDS ────────────────────────────────────
+    # 1. OWNER can never be granted through this endpoint: ownership
+    #    transfer is a deliberate, separate flow.
+    if req.role == WorkspaceRole.OWNER:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The owner role cannot be assigned here. Transfer ownership from workspace settings.",
+        )
+    # 2. Only the OWNER can grant the ADMIN role; admins may add members only.
+    if req.role == WorkspaceRole.ADMIN and caller.role != WorkspaceRole.OWNER:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the workspace owner can grant the admin role.",
+        )
+    # ───────────────────────────────────────────────────────────────────
+
     # Find user to invite
     target_res = await db.execute(select(User).where(User.email == req.email.lower()))
     target_user = target_res.scalar_one_or_none()
     if not target_user:
+        # Neutral wording: do not confirm whether the email has an account.
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="User with this email is not registered yet."
+            detail="This user could not be added. Check the email address or ask them to sign up first."
         )
 
     # Check existing membership

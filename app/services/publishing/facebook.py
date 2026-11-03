@@ -1,9 +1,12 @@
+import hashlib
+import hmac
 import uuid
 import logging
 from datetime import datetime, timezone
 from typing import Any, List, Dict
 import httpx
 
+from app.config import settings
 from app.services.publishing.base import (
     SocialPublishAdapter, RetryablePublishError, PermanentPublishError
 )
@@ -11,8 +14,18 @@ from app.services.publishing.base import (
 logger = logging.getLogger(__name__)
 
 
+def _appsecret_proof(access_token: str) -> str:
+    """HMAC-SHA256(access_token, app_secret) — Meta rejects token-only requests
+    once 'Require App Secret' is enabled, so a stolen token alone is useless."""
+    return hmac.new(
+        settings.FACEBOOK_APP_SECRET.encode("utf-8"),
+        access_token.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
 class FacebookAdapter(SocialPublishAdapter):
-    BASE_URL = "https://graph.facebook.com/v19.0"
+    BASE_URL = "https://graph.facebook.com/v21.0"
 
     def validate_media(self, media_urls: List[str]) -> List[str]:
         errors = []
@@ -29,6 +42,11 @@ class FacebookAdapter(SocialPublishAdapter):
         hashtags: List[str] = None,
         cta: str = None,
     ) -> Dict[str, Any]:
+        # Validate media against platform constraints
+        media_errors = self.validate_media(media_urls)
+        if media_errors:
+            raise PermanentPublishError("; ".join(media_errors))
+
         # Assemble complete text with hashtags and CTA
         full_text = post_caption
         if hashtags:
@@ -37,8 +55,9 @@ class FacebookAdapter(SocialPublishAdapter):
         if cta:
             full_text = f"{full_text}\n\n👉 {cta}"
 
-        # Check for Mock / Sandbox Token
-        if access_token.startswith("mock-") or access_token.startswith("mock-token-"):
+        # Check for Mock / Sandbox Token — NEVER honored in production:
+        # a simulated success there would show customers a fake "Published".
+        if settings.ENVIRONMENT != "production" and access_token.startswith(("mock-", "mock-token-")):
             mock_post_id = f"fb_mock_{uuid.uuid4().hex[:12]}"
             logger.info(f"[FacebookAdapter Mock] Simulated successful publish: {mock_post_id}")
             return {
@@ -71,6 +90,10 @@ class FacebookAdapter(SocialPublishAdapter):
                         "message": full_text,
                         "access_token": access_token,
                     }
+
+                # appsecret_proof on every outbound Graph API call (P0 hardening)
+                if settings.FACEBOOK_APP_SECRET:
+                    payload["appsecret_proof"] = _appsecret_proof(access_token)
 
                 resp = client.post(url, data=payload)
 

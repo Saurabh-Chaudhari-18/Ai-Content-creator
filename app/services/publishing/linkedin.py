@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import Any, List, Dict
 import httpx
 
+from app.config import settings
 from app.services.publishing.base import (
     SocialPublishAdapter, RetryablePublishError, PermanentPublishError
 )
@@ -39,8 +40,8 @@ class LinkedInAdapter(SocialPublishAdapter):
         if len(full_text) > 3000:
             raise PermanentPublishError("Post exceeds LinkedIn's 3,000 character limit.")
 
-        # Check for Mock / Sandbox Token
-        if access_token.startswith("mock-") or access_token.startswith("mock-token-"):
+        # Check for Mock / Sandbox Token — NEVER honored in production.
+        if settings.ENVIRONMENT != "production" and access_token.startswith(("mock-", "mock-token-")):
             mock_post_id = f"urn:li:share:mock_{uuid.uuid4().hex[:10]}"
             logger.info(f"[LinkedInAdapter Mock] Simulated UGC publish: {mock_post_id}")
             return {
@@ -52,6 +53,16 @@ class LinkedInAdapter(SocialPublishAdapter):
             }
 
         author_urn = account_metadata.get("author_urn") or f"urn:li:organization:{account_metadata.get('platform_account_id')}"
+
+        # MVP scope: TEXT-ONLY LinkedIn posts. Declaring IMAGE without first
+        # registering/uploading the asset (registerUpload → binary upload →
+        # media URN) is rejected by the API, so until that flow is built we
+        # publish the text and note that media was skipped.
+        if media_urls:
+            logger.warning(
+                "[LinkedInAdapter] Media attached but LinkedIn image upload is not yet "
+                "implemented (requires registerUpload flow). Publishing text only."
+            )
 
         try:
             with httpx.Client(timeout=30.0) as client:
@@ -66,7 +77,7 @@ class LinkedInAdapter(SocialPublishAdapter):
                     "specificContent": {
                         "com.linkedin.ugc.ShareContent": {
                             "shareCommentary": {"text": full_text},
-                            "shareMediaCategory": "NONE" if not media_urls else "IMAGE",
+                            "shareMediaCategory": "NONE",
                         }
                     },
                     "visibility": {"com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"},
@@ -81,9 +92,12 @@ class LinkedInAdapter(SocialPublishAdapter):
                         "url": f"https://linkedin.com/feed/update/{urn}",
                         "published_at": datetime.now(timezone.utc).isoformat(),
                         "mode": "live_api",
+                        "media_skipped": bool(media_urls),
                         "provider_response": data,
                     }
 
+                if resp.status_code == 429:
+                    raise RetryablePublishError("LinkedIn rate limit hit (429); will retry.")
                 if resp.status_code in [401, 403]:
                     raise PermanentPublishError(f"LinkedIn authentication/permission error: {resp.text}")
                 if resp.status_code >= 500:

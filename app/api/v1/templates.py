@@ -5,6 +5,7 @@ from uuid import UUID
 from typing import Optional, List
 
 from app.db.database import get_db
+from app.config import settings
 from app.models import CaptionTemplate, TemplateCategory, User
 from app.schemas.schemas import (
     CaptionTemplateResponse, CaptionTemplateCreate, CaptionTemplateListResponse, MessageResponse
@@ -97,7 +98,19 @@ async def create_template(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Create a new caption template."""
+    """Create a new caption template.
+
+    DEVELOPMENT/STAGING ONLY — caption_templates is a GLOBAL table shared by
+    every tenant. In production, templates are managed through seed data; an
+    open endpoint would let any customer inject content into every other
+    customer's Post Studio.
+    """
+    if settings.ENVIRONMENT == "production":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Template creation is managed by the platform team.",
+        )
+
     template = CaptionTemplate(
         industry=req.industry.strip(),
         category=TemplateCategory(req.category),
