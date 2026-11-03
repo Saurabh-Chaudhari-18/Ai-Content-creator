@@ -1,6 +1,10 @@
+import io
+import logging
 import os
 import uuid
 import aiofiles
+import filetype
+from PIL import Image
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -17,6 +21,8 @@ from app.core.security import compute_content_hash
 from app.core.dependencies import get_current_user
 from app.api.v1.posts import check_post_access, _cancel_queued_jobs
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/media", tags=["Media"])
 
 UPLOAD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "uploads")
@@ -24,6 +30,32 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 MAX_IMAGE_BYTES = 25 * 1024 * 1024    # 25 MB
 MAX_VIDEO_BYTES = 100 * 1024 * 1024   # 100 MB
+
+# Magic-byte MIME allowlists — the Content-Type header and the file
+# extension are both attacker-controlled; the file's actual bytes are not.
+ALLOWED_IMAGE_MIMES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+ALLOWED_VIDEO_MIMES = {"video/mp4", "video/quicktime", "video/webm"}
+
+
+def _strip_exif_in_place(file_path: str, ext: str) -> None:
+    """Re-encode an image without metadata (GPS coordinates, device serials).
+
+    Skipped for GIFs: re-encoding flattens animations and GIF carries no EXIF.
+    Best-effort: a corrupt-but-valid-magic file keeps its original bytes.
+    """
+    if ext == ".gif":
+        return
+    try:
+        with Image.open(file_path) as img:
+            fmt = img.format
+            if fmt == "JPEG" and img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+            clean = io.BytesIO()
+            img.save(clean, format=fmt)  # no exif kwarg = metadata dropped
+        with open(file_path, "wb") as f:
+            f.write(clean.getvalue())
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[Media] EXIF strip failed for {file_path}: {exc}")
 
 
 @router.post("/upload", response_model=MediaUploadResponse, status_code=status.HTTP_201_CREATED)
@@ -43,9 +75,11 @@ async def upload_media(
     if ext in allowed_images:
         media_type = MediaType.IMAGE
         max_bytes = MAX_IMAGE_BYTES
+        allowed_mimes = ALLOWED_IMAGE_MIMES
     elif ext in allowed_videos:
         media_type = MediaType.VIDEO
         max_bytes = MAX_VIDEO_BYTES
+        allowed_mimes = ALLOWED_VIDEO_MIMES
     else:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -70,10 +104,26 @@ async def upload_media(
     saved_filename = f"{uuid.uuid4().hex}{ext}"
     file_path = os.path.join(UPLOAD_DIR, saved_filename)
 
-    # Save to local storage with a server-side size cap.
+    # Save to local storage with magic-byte validation on the first chunk
+    # and a server-side size cap.
     total_bytes = 0
+    first_chunk = True
     async with aiofiles.open(file_path, "wb") as out_file:
         while content := await file.read(1024 * 1024):  # 1MB chunks
+            if first_chunk:
+                kind = filetype.guess(content)
+                if kind is None or kind.mime not in allowed_mimes:
+                    await out_file.close()
+                    try:
+                        os.remove(file_path)
+                    except OSError:
+                        pass
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="File content does not match an allowed media type "
+                               "(the extension is not trusted — actual bytes are checked).",
+                    )
+                first_chunk = False
             total_bytes += len(content)
             if total_bytes > max_bytes:
                 await out_file.close()
@@ -86,6 +136,19 @@ async def upload_media(
                     detail=f"File exceeds the {max_bytes // (1024 * 1024)}MB limit.",
                 )
             await out_file.write(content)
+
+    if first_chunk:  # zero-byte upload: nothing was read
+        try:
+            os.remove(file_path)
+        except OSError:
+            pass
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file is empty.")
+
+    # Strip EXIF metadata (GPS, camera serials) from photos before anything
+    # else can reference the file.
+    if media_type == MediaType.IMAGE:
+        _strip_exif_in_place(file_path, ext)
+        total_bytes = os.path.getsize(file_path)
 
     media_url = f"/static/uploads/{saved_filename}"
 

@@ -27,7 +27,10 @@ def _appsecret_proof(access_token: str) -> str:
 
 
 class InstagramAdapter(SocialPublishAdapter):
-    BASE_URL = "https://graph.facebook.com/v21.0"
+    @property
+    def BASE_URL(self) -> str:
+        # Externalized: Meta deprecates Graph API versions on a schedule.
+        return f"https://graph.facebook.com/{settings.META_GRAPH_API_VERSION}"
     ASPECT_RATIO_MIN = 4 / 5       # 0.8 (portrait)
     ASPECT_RATIO_MAX = 1.91 / 1    # 1.91 (landscape)
     CONTAINER_POLL_ATTEMPTS = 10   # x 3s = up to 30s wait

@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from uuid import UUID
+import jwt as pyjwt
 import re
 
 from app.db.database import get_db
@@ -33,6 +34,18 @@ router = APIRouter(prefix="/auth", tags=["Authentication"])
 def _generate_slug(name: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", name.lower()).strip("-")
     return f"{slug}-{int(datetime.now(timezone.utc).timestamp())}"
+
+
+def _new_refresh_record(user_id) -> tuple[str, RefreshToken]:
+    """Create a refresh token + its hashed DB record."""
+    refresh_token = create_refresh_token(subject=str(user_id))
+    record = RefreshToken(
+        user_id=user_id,
+        token_hash=hash_token(refresh_token),
+        expires_at=datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS),
+        is_revoked=False,
+    )
+    return refresh_token, record
 
 
 @router.post("/register", response_model=LoginResponse, status_code=status.HTTP_201_CREATED)
@@ -75,15 +88,7 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
 
     # Issue tokens
     access_token = create_access_token(subject=str(new_user.id))
-    refresh_token = create_refresh_token(subject=str(new_user.id))
-
-    # Persist refresh token
-    refresh_record = RefreshToken(
-        user_id=new_user.id,
-        token_hash=hash_token(refresh_token),
-        expires_at=datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS),
-        is_revoked=False,
-    )
+    refresh_token, refresh_record = _new_refresh_record(new_user.id)
     db.add(refresh_record)
     await db.commit()
     await db.refresh(new_user)
@@ -115,14 +120,7 @@ async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
         )
 
     access_token = create_access_token(subject=str(user.id))
-    refresh_token = create_refresh_token(subject=str(user.id))
-
-    refresh_record = RefreshToken(
-        user_id=user.id,
-        token_hash=hash_token(refresh_token),
-        expires_at=datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS),
-        is_revoked=False,
-    )
+    refresh_token, refresh_record = _new_refresh_record(user.id)
     db.add(refresh_record)
     await db.commit()
 
@@ -141,7 +139,7 @@ async def refresh_access_token(req: RefreshRequest, db: AsyncSession = Depends(g
         if payload.get("type") != "refresh":
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token type")
         user_id = payload.get("sub")
-    except Exception:
+    except pyjwt.PyJWTError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired refresh token")
 
     token_h = hash_token(req.refresh_token)
@@ -155,10 +153,27 @@ async def refresh_access_token(req: RefreshRequest, db: AsyncSession = Depends(g
     if not token_record or token_record.expires_at < datetime.now(timezone.utc):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token revoked or expired")
 
-    new_access_token = create_access_token(subject=user_id)
+    # The user must still exist and be active — a deactivated account must
+    # not keep minting fresh access tokens from an old refresh token.
+    user_res = await db.execute(select(User).where(User.id == UUID(user_id)))
+    user = user_res.scalar_one_or_none()
+    if not user or not user.is_active:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Account is inactive")
+
+    # ── REFRESH TOKEN ROTATION ─────────────────────────────────────────
+    # Each refresh consumes the old token and issues a new one. A stolen
+    # refresh token stops working the moment the legitimate client rotates,
+    # instead of staying valid for its full lifetime.
+    token_record.is_revoked = True
+    new_refresh_token, new_record = _new_refresh_record(user.id)
+    db.add(new_record)
+    await db.commit()
+    # ───────────────────────────────────────────────────────────────────
+
+    new_access_token = create_access_token(subject=str(user.id))
     return TokenResponse(
         access_token=new_access_token,
-        refresh_token=req.refresh_token,
+        refresh_token=new_refresh_token,  # client must store the NEW token
         token_type="bearer",
     )
 

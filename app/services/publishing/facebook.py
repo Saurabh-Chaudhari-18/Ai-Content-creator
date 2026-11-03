@@ -25,7 +25,10 @@ def _appsecret_proof(access_token: str) -> str:
 
 
 class FacebookAdapter(SocialPublishAdapter):
-    BASE_URL = "https://graph.facebook.com/v21.0"
+    @property
+    def BASE_URL(self) -> str:
+        # Externalized: Meta deprecates Graph API versions on a schedule.
+        return f"https://graph.facebook.com/{settings.META_GRAPH_API_VERSION}"
 
     def validate_media(self, media_urls: List[str]) -> List[str]:
         errors = []

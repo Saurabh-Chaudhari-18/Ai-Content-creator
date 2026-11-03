@@ -403,7 +403,12 @@ async def schedule_post(
     post.timezone = req.timezone
     post.status = PostStatus.SCHEDULED
 
-    # Create PublishJob for each target social account and dispatch to Celery
+    # Create one PublishJob per target social account. NO Celery dispatch
+    # happens here: a Celery Beat task (dispatch_due_jobs) scans publish_jobs
+    # every minute and dispatches due jobs as immediate tasks. Long-ETA
+    # dispatch on a Redis broker is unreliable (visibility_timeout re-delivery
+    # + loss on worker restart), and this way a down broker can never produce
+    # a post that says "scheduled" but has no task behind it.
     created_job_ids: List[UUID] = []
     for account in valid_accounts:
         job = PublishJob(
@@ -415,22 +420,6 @@ async def schedule_post(
         db.add(job)
         await db.flush()
         created_job_ids.append(job.id)
-
-        # Dispatch Celery background task with scheduled ETA
-        try:
-            from app.workers.tasks.publish import publish_post_task
-            task = publish_post_task.apply_async(
-                kwargs={
-                    "post_id": str(post.id),
-                    "social_account_id": str(account.id),
-                    "job_id": str(job.id),
-                },
-                eta=req.scheduled_at,
-            )
-            job.celery_task_id = task.id
-        except Exception as exc:
-            import logging
-            logging.getLogger(__name__).warning(f"Celery task dispatch skipped (broker unavailable or offline): {exc}")
 
     await db.commit()
 

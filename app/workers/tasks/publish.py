@@ -15,6 +15,52 @@ from app.services.publishing.base import RetryablePublishError, PermanentPublish
 logger = logging.getLogger(__name__)
 
 
+@shared_task(name="app.workers.tasks.publish.dispatch_due_jobs")
+def dispatch_due_jobs():
+    """
+    Celery Beat task (every minute): scan publish_jobs for due work and
+    dispatch each as an IMMEDIATE Celery task.
+
+    This replaces long-ETA dispatch, which is unreliable on Redis (tasks are
+    re-delivered every visibility_timeout and lost on worker restarts).
+    `celery_task_id IS NULL` marks a job as not-yet-dispatched, so a slow
+    worker or overlapping scan never dispatches the same job twice;
+    FOR UPDATE SKIP LOCKED protects against concurrent Beat scans.
+    """
+    now = datetime.now(timezone.utc)
+    dispatched = 0
+    with get_sync_db() as db:
+        due_jobs = (
+            db.query(PublishJob)
+            .filter(
+                PublishJob.status == JobStatus.QUEUED,
+                PublishJob.celery_task_id == None,
+                PublishJob.scheduled_for != None,
+                PublishJob.scheduled_for <= now,
+            )
+            .with_for_update(skip_locked=True)
+            .limit(100)
+            .all()
+        )
+
+        for job in due_jobs:
+            task = publish_post_task.apply_async(
+                kwargs={
+                    "post_id": str(job.post_id),
+                    "social_account_id": str(job.social_account_id),
+                    "job_id": str(job.id),
+                }
+            )
+            job.celery_task_id = task.id
+            dispatched += 1
+
+        db.commit()
+
+    if dispatched:
+        logger.info(f"[Dispatcher] Dispatched {dispatched} due publish job(s).")
+    return {"dispatched": dispatched}
+
+
 def _retry_or_fail(task, db, post, job, exc):
     """Retry with backoff while attempts remain; otherwise mark job + post failed.
 
@@ -54,6 +100,9 @@ def publish_post_task(self, post_id: str, social_account_id: str, job_id: str):
     Celery task: Dispatch an approved post to a social platform.
 
     Guards enforced:
+    0. The job itself must be QUEUED. A job found PROCESSING means a previous
+       attempt crashed after (possibly) reaching the platform — unknown
+       outcome, never blindly re-publish.
     1. Post status must be 'scheduled' or 'publishing'.
     2. Content hash — recomputed from the ACTUAL caption + media — must match
        the hash recorded at approval time (tamper detection).
@@ -78,8 +127,27 @@ def publish_post_task(self, post_id: str, social_account_id: str, job_id: str):
                 db.commit()
             return {"status": "aborted", "reason": "record_not_found"}
 
-        # Guard 0: job must still be pending work — a CANCELLED/COMPLETED job
-        # delivered late (or re-delivered) must never execute again.
+        # Guard 0a: DOUBLE-PUBLISH PROTECTION. The job transitions to
+        # PROCESSING (committed) right before the platform API call. If this
+        # execution finds it already PROCESSING, a previous attempt crashed
+        # mid-call and may have already published. Facebook's feed API has no
+        # idempotency key, so the only safe move is to stop and flag it.
+        if job.status == JobStatus.PROCESSING and self.request.retries == 0:
+            logger.error(
+                f"[Publish Worker] Job {job_id} was already PROCESSING on delivery — "
+                f"previous attempt has an UNKNOWN outcome. Not re-publishing."
+            )
+            post.status = PostStatus.FAILED
+            job.status = JobStatus.FAILED
+            job.error_message = (
+                "Unknown outcome: a previous attempt crashed after dispatch. "
+                "Check the social platform for the post before retrying."
+            )
+            job.processed_at = datetime.now(timezone.utc)
+            db.commit()
+            return {"status": "failed", "reason": "unknown_outcome"}
+
+        # Guard 0b: cancelled/completed/failed jobs delivered late never run.
         if job.status not in (JobStatus.QUEUED, JobStatus.PROCESSING):
             logger.warning(f"[Publish Worker] Job {job_id} is '{job.status}'. Skipping.")
             return {"status": "skipped", "reason": f"job_{job.status.value}"}
@@ -135,7 +203,9 @@ def publish_post_task(self, post_id: str, social_account_id: str, job_id: str):
             db.commit()
             return {"status": "failed", "reason": "workspace_mismatch"}
 
-        # Transition to publishing state
+        # COMMIT BARRIER: the job is marked PROCESSING and committed BEFORE
+        # the platform API call, so a crash after the call is detectable as
+        # an unknown outcome (Guard 0a) instead of silently double-publishing.
         post.status = PostStatus.PUBLISHING
         job.status = JobStatus.PROCESSING
         job.attempt_number = self.request.retries + 1
