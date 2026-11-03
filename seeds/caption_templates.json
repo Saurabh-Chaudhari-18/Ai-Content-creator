@@ -1,0 +1,82 @@
+[
+  {
+    "industry": "Restaurant & Cafe",
+    "category": "promotional",
+    "title": "New Signature Item Launch",
+    "template_text": "☕ Meet your new daily obsession: our single-origin [Item Name]! Crafted with premium beans and roasted locally to perfection. Drop by this week to taste the difference.",
+    "suggested_hashtags": ["#SpecialtyCoffee", "#CoffeeLovers", "#LocalRoast", "#CafeVibes", "#MorningBrew"],
+    "suggested_cta": "Visit Us Today"
+  },
+  {
+    "industry": "Restaurant & Cafe",
+    "category": "engagement",
+    "title": "Weekend Question / Poll",
+    "template_text": "Team Iced or Team Hot? ❄️🔥 Let us know your go-to beverage order in the comments below! We might just feature your choice on tomorrow's special board.",
+    "suggested_hashtags": ["#CoffeeCommunity", "#CoffeeQuestion", "#IcedCoffee", "#LatteArt", "#CafeCulture"],
+    "suggested_cta": "Drop Your Pick in Comments"
+  },
+  {
+    "industry": "Restaurant & Cafe",
+    "category": "seasonal",
+    "title": "Seasonal Menu Delight",
+    "template_text": "🍁 Spiced notes, cozy mornings, and freshly baked pastries. Our Autumn Seasonal Menu is officially live! Grab your favorite corner table and warm up with us.",
+    "suggested_hashtags": ["#AutumnVibes", "#SeasonalMenu", "#ComfortFood", "#BakeryFresh", "#CozyCafe"],
+    "suggested_cta": "Order Ahead via Link in Bio"
+  },
+  {
+    "industry": "SaaS & Tech",
+    "category": "promotional",
+    "title": "Feature Announcement",
+    "template_text": "🚀 Stop wasting 5+ hours every week on manual updates. Today, we're thrilled to unveil [Feature Name] — automated, intelligent, and built right into your workflow. See how it cuts your cycle time in half.",
+    "suggested_hashtags": ["#ProductUpdate", "#B2BTech", "#ProductivityHack", "#SoftwareEngineering", "#WorkSmarter"],
+    "suggested_cta": "Start Free 14-Day Trial"
+  },
+  {
+    "industry": "SaaS & Tech",
+    "category": "educational",
+    "title": "3 Quick Tips / Pro-Tip",
+    "template_text": "💡 3 common bottlenecks growth teams face in 2026 (and how to fix them):\n1. Siloed metrics\n2. Sluggish approval loops\n3. Inconsistent publishing cadence\n\nSwipe through to see our breakdown on solving #2 without endless Slack threads 👉",
+    "suggested_hashtags": ["#TechLeadership", "#GrowthStrategy", "#WorkflowOptimization", "#SaaSTips", "#AgencyGrowth"],
+    "suggested_cta": "Save This Post for Later"
+  },
+  {
+    "industry": "SaaS & Tech",
+    "category": "engagement",
+    "title": "Industry Discussion / Hot Take",
+    "template_text": "🔥 Unpopular opinion: More tools don't equal more productivity. In fact, app sprawl is costing teams an average of 42 minutes per day in context switching. How many SaaS tools are you currently juggling?",
+    "suggested_hashtags": ["#FutureOfWork", "#TechDebate", "#Productivity", "#SaaSIndustry", "#WorkplaceEfficiency"],
+    "suggested_cta": "Share Your Thoughts Below"
+  },
+  {
+    "industry": "E-commerce & Retail",
+    "category": "promotional",
+    "title": "Limited-Time Flash Sale",
+    "template_text": "⚡ FLASH SALE ALERT: Take 25% off our best-selling [Collection Name] this weekend only! Use code FLASH25 at checkout. Limited stock available.",
+    "suggested_hashtags": ["#FlashSale", "#ShopNow", "#StyleInspo", "#WeekendSale", "#LimitedDrop"],
+    "suggested_cta": "Shop the Sale via Link in Bio"
+  },
+  {
+    "industry": "E-commerce & Retail",
+    "category": "seasonal",
+    "title": "Holiday Gift Guide",
+    "template_text": "🎁 Holiday shopping made effortless. Our 2026 Curated Gift Guide is here — featuring hand-picked favorites for everyone on your list, under $50.",
+    "suggested_hashtags": ["#GiftGuide", "#HolidayShopping", "#CuratedPicks", "#ThoughtfulGifting", "#GiftIdeas"],
+    "suggested_cta": "Explore the Gift Guide"
+  },
+  {
+    "industry": "Fitness & Wellness",
+    "category": "educational",
+    "title": "Recovery & Consistency Tip",
+    "template_text": "💪 Remember: Results aren't just built in the gym; they are forged in your recovery. Hydration, quality sleep, and smart progressive overload beat burnout every single time.",
+    "suggested_hashtags": ["#FitnessTips", "#RecoveryMatters", "#HealthAndWellness", "#ConsistentEffort", "#GymMotivation"],
+    "suggested_cta": "Tag a Workout Partner"
+  },
+  {
+    "industry": "Real Estate",
+    "category": "promotional",
+    "title": "New Exclusive Listing",
+    "template_text": "🏡 Just Listed! Step inside this beautifully designed property in [Neighborhood]. Featuring an open-concept layout, sun-drenched living areas, and a private outdoor retreat.",
+    "suggested_hashtags": ["#JustListed", "#DreamHome", "#RealEstateInvesting", "#ModernLiving", "#PropertyTour"],
+    "suggested_cta": "DM Us for Private Showing"
+  }
+]
